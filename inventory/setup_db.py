@@ -1,7 +1,6 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta
-
 import numpy as np
 
 DB_PATH = 'data/inventory.db'
@@ -11,194 +10,105 @@ CATALOG = [
     ('CAT_VANG', 'Cát vàng hạt lớn', 'm³', 200, 250000),
     ('CAT_XAY', 'Cát xây tô', 'm³', 150, 180000),
 ]
-OPENING_STOCK = {
-    'CAT_VANG': 1550.0,
-    'CAT_XAY': 1220.0,
-}
-SCHEDULED_IMPORT = {
-    'CAT_VANG': 300.0,
-    'CAT_XAY': 250.0,
-}
-EMERGENCY_IMPORT = {
-    'CAT_VANG': 900.0,
-    'CAT_XAY': 700.0,
-}
-MIN_BUFFER = {
-    'CAT_VANG': 220.0,
-    'CAT_XAY': 160.0,
-}
-
 
 def _create_tables(cursor):
-    cursor.execute(
-        '''
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS DM_HangHoa (
-            Ma_Hang TEXT PRIMARY KEY CHECK (Ma_Hang IN ('CAT_VANG', 'CAT_XAY')),
-            Ten_Hang TEXT NOT NULL,
-            Don_Vi TEXT NOT NULL,
-            Nguong_An_Toan REAL NOT NULL CHECK (Nguong_An_Toan >= 0),
-            Don_Gia REAL NOT NULL CHECK (Don_Gia >= 0)
+            Ma_Hang TEXT PRIMARY KEY, Ten_Hang TEXT, Don_Vi TEXT, Nguong_An_Toan REAL, Don_Gia REAL
         )
-        '''
-    )
-    cursor.execute(
-        '''
+    ''')
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS Kho_Hien_Tai (
-            Ma_Hang TEXT PRIMARY KEY CHECK (Ma_Hang IN ('CAT_VANG', 'CAT_XAY')),
-            So_Luong_Ton REAL NOT NULL CHECK (So_Luong_Ton >= 0),
-            Ngay_Cap_Nhat_Cuoi TEXT NOT NULL,
-            FOREIGN KEY (Ma_Hang) REFERENCES DM_HangHoa(Ma_Hang)
+            Ma_Hang TEXT PRIMARY KEY, So_Luong_Ton REAL, Ngay_Cap_Nhat_Cuoi TEXT
         )
-        '''
-    )
-    cursor.execute(
-        '''
+    ''')
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS Nhat_Ky_Giao_Dich (
-            ID INTEGER PRIMARY KEY AUTOINCREMENT,
-            Ngay_Giao_Dich TEXT NOT NULL,
-            Loai_GD TEXT NOT NULL CHECK (Loai_GD IN ('Nhap', 'Xuat')),
-            Ma_Hang TEXT NOT NULL CHECK (Ma_Hang IN ('CAT_VANG', 'CAT_XAY')),
-            So_Luong REAL NOT NULL CHECK (So_Luong > 0),
-            Doi_Tac TEXT NOT NULL DEFAULT '',
-            FOREIGN KEY (Ma_Hang) REFERENCES DM_HangHoa(Ma_Hang)
+            ID INTEGER PRIMARY KEY AUTOINCREMENT, Ngay_Giao_Dich TEXT, Loai_GD TEXT, 
+            Ma_Hang TEXT, So_Luong REAL, Doi_Tac TEXT
         )
-        '''
-    )
-    cursor.execute(
-        'CREATE INDEX IF NOT EXISTS idx_nhat_ky_ngay ON Nhat_Ky_Giao_Dich(Ngay_Giao_Dich)'
-    )
+    ''')
 
-
-def _add_import(history, stock, when_dt, item_code, quantity, partner):
-    qty = round(float(quantity), 1)
-    history.append(
-        (
-            when_dt.strftime('%Y-%m-%d %H:%M:%S'),
-            'Nhap',
-            item_code,
-            qty,
-            partner,
-        )
-    )
-    stock[item_code] = round(stock[item_code] + qty, 1)
-
-
-def _add_export(history, stock, when_dt, item_code, quantity, partner):
-    qty = round(float(quantity), 1)
-    history.append(
-        (
-            when_dt.strftime('%Y-%m-%d %H:%M:%S'),
-            'Xuat',
-            item_code,
-            qty,
-            partner,
-        )
-    )
-    stock[item_code] = round(stock[item_code] - qty, 1)
-
-
-def build_history(days: int = 730, seed: int = 42):
+def generate_stationary_timeseries(days=1460, seed=42):
+    """
+    Tạo dữ liệu 4 năm (1460 ngày) có tính chu kỳ và phương sai ổn định (Stationary).
+    Sử dụng hàm Sine để tạo mùa vụ và White Noise để tạo nhiễu ngẫu nhiên.
+    """
     np.random.seed(seed)
-    now = datetime.now().replace(second=0, microsecond=0)
-    history_end = now - timedelta(days=1)
-    stock = {code: float(value) for code, value in OPENING_STOCK.items()}
-    history: list[tuple[str, str, str, float, str]] = []
-
+    now = datetime.now().replace(hour=17, minute=0, second=0, microsecond=0)
+    
+    history = []
+    # Tồn kho ban đầu
+    stock = {'CAT_VANG': 500.0, 'CAT_XAY': 400.0}
+    
+    # Các hằng số cho hàm chuỗi thời gian (Time Series)
+    # y(t) = Baseline + Amplitude * sin(2 * pi * t / 365) + Noise
+    baseline_vang, amp_vang = 20, 10
+    baseline_xay, amp_xay = 15, 8
+    
+    # Duyệt từ 4 năm trước đến hôm nay
     for offset in range(days, -1, -1):
-        current_date = history_end - timedelta(days=offset)
-        month = current_date.month
-        factor = 0.3 if month in [7, 8] else (1.5 if month in [1, 2, 11, 12] else 1.0)
+        current_date = now - timedelta(days=offset)
+        t = current_date.timetuple().tm_yday # Ngày thứ mấy trong năm (1-365)
+        
+        # 1. Tính toán lượng xuất kho (Sales) theo mô hình SARIMA lý tưởng
+        # Dùng sin() để tạo chu kỳ. Bán mạnh cuối/đầu năm, giảm vào giữa năm (tháng 7, 8)
+        seasonality_factor = np.cos(2 * np.pi * (t - 30) / 365) 
+        
+        noise_vang = np.random.normal(0, 3) # Nhiễu trắng (White noise), mean=0, std=3
+        noise_xay = np.random.normal(0, 2)
+        
+        out_vang = max(1.0, round(baseline_vang + amp_vang * seasonality_factor + noise_vang, 1))
+        out_xay = max(1.0, round(baseline_xay + amp_xay * seasonality_factor + noise_xay, 1))
+        
+        # Ghi nhận giao dịch xuất
+        history.append((current_date.strftime('%Y-%m-%d 10:30:00'), 'Xuat', 'CAT_VANG', out_vang, 'Khách lẻ/Công trình'))
+        history.append((current_date.strftime('%Y-%m-%d 14:15:00'), 'Xuat', 'CAT_XAY', out_xay, 'Công trình B'))
+        stock['CAT_VANG'] -= out_vang
+        stock['CAT_XAY'] -= out_xay
+        
+        # 2. Logic nhập kho tự động (Replenishment)
+        # Giữ cho tồn kho không bị cạn kiệt và xoay quanh một mức trung bình
+        if stock['CAT_VANG'] < 250:
+            import_qty = round(np.random.normal(400, 20), 1)
+            history.append((current_date.strftime('%Y-%m-%d 08:00:00'), 'Nhap', 'CAT_VANG', import_qty, 'NCC Mỏ Cát A'))
+            stock['CAT_VANG'] += import_qty
+            
+        if stock['CAT_XAY'] < 200:
+            import_qty = round(np.random.normal(300, 15), 1)
+            history.append((current_date.strftime('%Y-%m-%d 08:30:00'), 'Nhap', 'CAT_XAY', import_qty, 'NCC Mỏ Cát B'))
+            stock['CAT_XAY'] += import_qty
 
-        if offset % 15 == 0:
-            _add_import(
-                history,
-                stock,
-                current_date.replace(hour=8, minute=0),
-                'CAT_VANG',
-                SCHEDULED_IMPORT['CAT_VANG'],
-                'NCC Mỏ Cát A',
-            )
-            _add_import(
-                history,
-                stock,
-                current_date.replace(hour=8, minute=5),
-                'CAT_XAY',
-                SCHEDULED_IMPORT['CAT_XAY'],
-                'NCC Mỏ Cát B',
-            )
-
-        for _ in range(np.random.randint(1, 4)):
-            export_time = current_date.replace(
-                hour=int(np.random.randint(7, 18)),
-                minute=int(np.random.randint(0, 60)),
-            )
-
-            qty_vang = round(float(np.random.randint(10, 30) * factor), 1)
-            qty_xay = round(float(np.random.randint(8, 25) * factor), 1)
-
-            if stock['CAT_VANG'] < qty_vang + MIN_BUFFER['CAT_VANG']:
-                _add_import(
-                    history,
-                    stock,
-                    current_date.replace(hour=6, minute=int(np.random.randint(0, 20))),
-                    'CAT_VANG',
-                    max(EMERGENCY_IMPORT['CAT_VANG'], qty_vang * 4),
-                    'NCC Mỏ Cát A - Bổ sung nhanh',
-                )
-            if stock['CAT_XAY'] < qty_xay + MIN_BUFFER['CAT_XAY']:
-                _add_import(
-                    history,
-                    stock,
-                    current_date.replace(hour=6, minute=20 + int(np.random.randint(0, 20))),
-                    'CAT_XAY',
-                    max(EMERGENCY_IMPORT['CAT_XAY'], qty_xay * 4),
-                    'NCC Mỏ Cát B - Bổ sung nhanh',
-                )
-
-            _add_export(history, stock, export_time, 'CAT_VANG', qty_vang, 'Khách lẻ / Công trình')
-            _add_export(history, stock, export_time, 'CAT_XAY', qty_xay, 'Công trình B')
-
-    history.sort(key=lambda row: row[0])
     return history, stock, now
 
-
-def init_db(days: int = 730):
+def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     _create_tables(cursor)
-
     cursor.execute('DELETE FROM Nhat_Ky_Giao_Dich')
     cursor.execute('DELETE FROM Kho_Hien_Tai')
     cursor.execute('DELETE FROM DM_HangHoa')
 
+    # Thêm danh mục
     cursor.executemany('INSERT INTO DM_HangHoa VALUES (?,?,?,?,?)', CATALOG)
 
-    history_data, current_stock, now = build_history(days=days)
+    # Sinh data Time Series 4 năm (1460 ngày)
+    history_data, current_stock, now = generate_stationary_timeseries(days=1460)
 
-    cursor.executemany(
-        '''
-        INSERT INTO Nhat_Ky_Giao_Dich
-            (Ngay_Giao_Dich, Loai_GD, Ma_Hang, So_Luong, Doi_Tac)
+    # Thêm lịch sử giao dịch
+    cursor.executemany('''
+        INSERT INTO Nhat_Ky_Giao_Dich (Ngay_Giao_Dich, Loai_GD, Ma_Hang, So_Luong, Doi_Tac)
         VALUES (?, ?, ?, ?, ?)
-        ''',
-        history_data,
-    )
+    ''', history_data)
 
-    stock_rows = [
-        (code, round(current_stock[code], 1), now.strftime('%Y-%m-%d %H:%M:%S'))
-        for code, *_ in CATALOG
-    ]
+    # Cập nhật tồn kho hiện tại
+    stock_rows = [(code, round(current_stock[code], 1), now.strftime('%Y-%m-%d %H:%M:%S')) for code in current_stock]
     cursor.executemany('INSERT INTO Kho_Hien_Tai VALUES (?,?,?)', stock_rows)
 
     conn.commit()
     conn.close()
-
-    print('✅ Đã tạo database chỉ gồm 2 mặt hàng cát và đồng bộ tồn kho với lịch sử giao dịch.')
-    print('📦 Tồn hiện tại:')
-    for code, qty, _ in stock_rows:
-        print(f'   - {code}: {qty:,.1f} m³')
-
+    print(" Đã tạo thành công Database 4 năm với dữ liệu chuỗi thời gian (Stationary).")
 
 if __name__ == '__main__':
     init_db()

@@ -7,6 +7,9 @@ from typing import Any
 import pandas as pd
 from dotenv import load_dotenv
 
+# --- [THÊM] Import module analytics chứa hàm SARIMA ---
+from inventory import analytics
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=ENV_PATH, override=False)
@@ -151,6 +154,7 @@ def _fallback_response(
     df_dm: pd.DataFrame,
     df_history: pd.DataFrame,
     extra_debug: str | None = None,
+    forecast_info: str = "" # --- [THÊM] Truyền dự báo vào fallback nếu API lỗi
 ) -> str:
     merged = df_stock.merge(df_dm, on="Ma_Hang", how="left")
     merged["So_Luong_Ton"] = pd.to_numeric(
@@ -171,11 +175,14 @@ def _fallback_response(
     latest = history.head(8)
     q = (user_query or "").lower()
     lines: list[str] = []
+    
+    # Đưa thông tin dự báo lên đầu nếu có
+    if forecast_info:
+        lines.append("🔮 Dự báo SARIMA (Offline mode):")
+        lines.append(forecast_info)
 
     if "kiểm kê" in q or "điều chỉnh" in q:
-        lines.append(
-            "Bạn có thể dùng tab Kiểm kê & Điều chỉnh để nhập số lượng thực tế và ghi nhận chênh lệch ngay vào hệ thống."
-        )
+        lines.append("Bạn có thể dùng tab Kiểm kê & Điều chỉnh để nhập số lượng thực tế và ghi nhận chênh lệch ngay vào hệ thống.")
 
     if "nhập" in q or "mua" in q or "reorder" in q or "cần nhập" in q:
         if low_items.empty:
@@ -187,27 +194,6 @@ def _fallback_response(
                     f"- {row['Ten_Hang']}: tồn {row['So_Luong_Ton']:.1f} m3, thấp hơn ngưỡng {row['Nguong_An_Toan']:.1f} m3. Nên nhập thêm tối thiểu {deficit + 80:.1f} m3."
                 )
 
-    if ("xuất" in q or "bán" in q or "ban" in q) and not history.empty:
-        recent_out = history[history["Loai_GD"] == "Xuat"].copy()
-        if not recent_out.empty:
-            summary = recent_out.groupby("Ma_Hang", as_index=False)["So_Luong"].sum()
-            for _, row in summary.iterrows():
-                ten_hang = df_dm.loc[
-                    df_dm["Ma_Hang"] == row["Ma_Hang"], "Ten_Hang"
-                ].iloc[0]
-                lines.append(f"- Tổng xuất gần đây của {ten_hang}: {row['So_Luong']:.1f} m3.")
-
-    if "đối tác" in q or "khách" in q or "nhà cung cấp" in q:
-        if not history.empty:
-            recent_by_partner = (
-                history.groupby(["Loai_GD", "Doi_Tac"], as_index=False)["So_Luong"]
-                .sum()
-                .sort_values("So_Luong", ascending=False)
-                .head(6)
-            )
-            for _, row in recent_by_partner.iterrows():
-                lines.append(f"- {row['Loai_GD']} / {row['Doi_Tac']}: {row['So_Luong']:.1f} m3.")
-
     if ("tồn" in q or "ton" in q or "kho" in q or "stock" in q) or not lines:
         for _, row in merged.iterrows():
             status = "an toàn"
@@ -217,21 +203,11 @@ def _fallback_response(
                 f"- {row['Ten_Hang']}: tồn {row['So_Luong_Ton']:.1f} m3, ngưỡng an toàn {row['Nguong_An_Toan']:.1f} m3, trạng thái {status}."
             )
 
-    lines.extend(_build_replenishment_summary(df_stock, df_dm, df_history)[:2])
-
-    if not latest.empty:
-        last_time = latest.iloc[0]["Ngay_Giao_Dich"]
-        last_row = latest.iloc[0]
-        if pd.notna(last_time):
-            lines.append(
-                f"- Giao dịch mới nhất: {last_row['Loai_GD']} {last_row['So_Luong']:.1f} m3 {last_row['Ma_Hang']} lúc {last_time.strftime('%d/%m/%Y %H:%M')}."
-            )
-
-    header = "⚙️ Chế độ phản hồi nội bộ"
+    header = "⚙️ Chế độ phản hồi nội bộ (Fallback)"
     if extra_debug:
         header += f" | Debug: {extra_debug}"
 
-    return header + "\n" + "\n".join(lines[:10])
+    return header + "\n" + "\n".join(lines[:15])
 
 
 def get_copilot_response(
@@ -239,14 +215,26 @@ def get_copilot_response(
     df_stock: pd.DataFrame,
     df_dm: pd.DataFrame,
     df_history: pd.DataFrame,
+    forecast_months: int = 3 # --- [THÊM] Khai báo số tháng AI cần dự báo
 ) -> str:
+    
+    # --- [THÊM] GỌI MODEL SARIMA LẤY DỰ BÁO TRƯỚC KHI TRẢ LỜI ---
+    forecast_info = ""
+    for ma_hang in ["CAT_VANG", "CAT_XAY"]:
+        try:
+            fc = analytics.get_sarima_forecast(ma_hang, steps=forecast_months)
+            if fc:
+                fc_str = ", ".join([f"T+{i+1}: {val:.1f}m3" for i, val in enumerate(fc)])
+                forecast_info += f"- {ma_hang}: {fc_str}\n"
+        except Exception as e:
+            forecast_info += f"- {ma_hang}: Chưa đủ dữ liệu/Lỗi tính toán SARIMA\n"
+    # -------------------------------------------------------------
+
     if CLIENT is None:
         return _fallback_response(
-            user_query,
-            df_stock,
-            df_dm,
-            df_history,
+            user_query, df_stock, df_dm, df_history,
             extra_debug=CLIENT_INIT_ERROR or "Gemini client chưa sẵn sàng",
+            forecast_info=forecast_info
         )
 
     stock_info = (
@@ -257,19 +245,25 @@ def get_copilot_response(
     )
     recent_history = df_history.head(12).to_string(index=False)
 
+    # --- [SỬA] Đưa dự báo SARIMA vào System Prompt để AI làm căn cứ ---
     prompt = f"""
 Bạn là AI Copilot chuyên quản lý kho cát xây dựng.
 Hệ thống này CHỈ quản lý 2 mặt hàng cố định: Cát vàng hạt lớn và Cát xây tô.
 
-[TỒN KHO]
+[🔮 DỰ BÁO XUẤT KHO TỪ MÔ HÌNH SARIMA ({forecast_months} THÁNG TỚI)]
+{forecast_info}
+
+[TỒN KHO THỰC TẾ HIỆN TẠI]
 {stock_info}
 
 [12 GIAO DỊCH GẦN NHẤT]
 {recent_history}
 
-Yêu cầu:
-- Trả lời ngắn gọn bằng tiếng Việt.
-- Tập trung vào cảnh báo nhập thêm, rủi ro âm hàng, nhịp xuất bán, đối soát tồn thực tế và khuyến nghị hành động.
+Yêu cầu cực kỳ quan trọng:
+- Trả lời ngắn gọn, chuyên nghiệp bằng tiếng Việt.
+- KHI NGƯỜI DÙNG HỎI VỀ NHẬP HÀNG/TƯƠNG LAI: Hãy so sánh trực tiếp số lượng [TỒN KHO THỰC TẾ] với [DỰ BÁO SARIMA]. 
+- Nếu tổng dự báo lớn hơn tồn kho hiện tại, hãy cảnh báo nguy cơ đứt gãy chuỗi cung ứng và đề xuất nhập hàng (Ghi rõ số lượng m3 cụ thể nên nhập bù).
+- Giải thích cho chủ kho hiểu quyết định của bạn được back-up bằng mô hình thống kê SARIMA.
 - Không đề xuất mở rộng thêm mặt hàng khác.
 
 Câu hỏi người dùng: {user_query}
@@ -291,17 +285,13 @@ Câu hỏi người dùng: {user_query}
             finish_reason = getattr(candidates[0], "finish_reason", None)
 
         return _fallback_response(
-            user_query,
-            df_stock,
-            df_dm,
-            df_history,
+            user_query, df_stock, df_dm, df_history,
             extra_debug=f"Gemini trả response rỗng, finish_reason={finish_reason}",
+            forecast_info=forecast_info
         )
     except Exception as exc:
         return _fallback_response(
-            user_query,
-            df_stock,
-            df_dm,
-            df_history,
+            user_query, df_stock, df_dm, df_history,
             extra_debug=f"Lỗi gọi Gemini: {exc}",
+            forecast_info=forecast_info
         )

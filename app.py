@@ -6,6 +6,7 @@ import streamlit as st
 
 from inventory import ai_agent
 from inventory import database as db
+from inventory import analytics  # --- [GIỮ NGUYÊN] Import module analytics chứa SARIMA ---
 
 st.set_page_config(page_title="AI Inventory Copilot", layout="wide")
 
@@ -96,19 +97,7 @@ def draw_stock_chart(df, loai_gd, colors):
     if df_plot.empty:
         return st.info(f"Chưa có dữ liệu {loai_gd}.")
 
-    resolution = st.radio(
-        f"Gộp dữ liệu ({loai_gd})",
-        ["Theo Giờ", "Theo Ngày", "Theo Tháng"],
-        horizontal=True,
-        key=f"res_{loai_gd}",
-    )
-
-    if resolution == "Theo Giờ":
-        df_plot["Time"] = df_plot["Ngay_Giao_Dich"].dt.floor("h")
-    elif resolution == "Theo Tháng":
-        df_plot["Time"] = df_plot["Ngay_Giao_Dich"].dt.to_period("M").dt.to_timestamp()
-    else:
-        df_plot["Time"] = df_plot["Ngay_Giao_Dich"].dt.floor("d")
+    df_plot["Time"] = df_plot["Ngay_Giao_Dich"].dt.floor("d")
 
     trend = (
         df_plot.groupby(["Time", "Ma_Hang"], as_index=False)["So_Luong"]
@@ -121,7 +110,7 @@ def draw_stock_chart(df, loai_gd, colors):
         x="Time",
         y="So_Luong",
         color="Ma_Hang",
-        barmode="group",
+        barmode="stack",
         color_discrete_sequence=colors,
         category_orders={"Ma_Hang": ITEM_ORDER},
         labels={
@@ -130,6 +119,8 @@ def draw_stock_chart(df, loai_gd, colors):
             "Ma_Hang": "Mặt hàng",
         },
     )
+
+    fig.update_traces(marker_line_width=0)
 
     fig.update_xaxes(
         rangeslider_visible=True,
@@ -149,13 +140,20 @@ def draw_stock_chart(df, loai_gd, colors):
             activecolor="#3B82F6",
         ),
     )
+    
+    recent_date = df_plot['Ngay_Giao_Dich'].max()
+    start_date = recent_date - pd.DateOffset(months=3)
+    fig.update_xaxes(range=[start_date, recent_date])
+    
     fig.update_layout(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=0, r=0, t=30, b=0),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
+        bargap=0.1
     )
-    st.plotly_chart(fig, width="stretch")
+    
+    st.plotly_chart(fig, use_container_width=True, key=f"chart_{loai_gd}")
 
 
 def build_replenishment_table(df_stock, df_dm, df_history, lookback_days: int):
@@ -287,33 +285,63 @@ except Exception as exc:
     st.caption(str(exc))
     st.stop()
 
+
+# --- BỘ LỌC CUỘN THEO NĂM ---
+df_history_all['Year'] = df_history_all['Ngay_Giao_Dich'].dt.year
+available_years = sorted(df_history_all['Year'].dropna().unique(), reverse=True)
+
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("📅 Bộ lọc Thời gian")
+    if available_years:
+        selected_year = st.selectbox("Hiển thị dữ liệu của Năm:", available_years)
+    else:
+        selected_year = pd.Timestamp.now().year
+        st.selectbox("Hiển thị dữ liệu của Năm:", [selected_year])
+
+df_history_filtered = df_history_all[df_history_all['Year'] == selected_year].copy()
+# ------------------------------------------------
+
+
 col_dash, col_chat = st.columns([7, 3], gap="large")
 
 with col_dash:
     st.title("🏗️ Dashboard Quản Lý Kho Cát")
     st.caption(
-        "Hệ thống được tối ưu riêng cho 2 mặt hàng: Cát vàng hạt lớn và Cát xây tô. Đã bổ sung thêm trung tâm nhập hàng, kiểm kê đối soát và phân tích đối tác."
+        f"Hệ thống được tối ưu riêng cho 2 mặt hàng: Cát vàng hạt lớn và Cát xây tô. Đang hiển thị dữ liệu giao dịch của năm **{selected_year}**."
     )
     st.markdown("---")
 
     cols = st.columns(len(df_stock))
     for i, row in df_stock.iterrows():
-        dm_info = df_dm[df_dm["Ma_Hang"] == row["Ma_Hang"]].iloc[0]
+        ma_hang = row["Ma_Hang"]
+        dm_info = df_dm[df_dm["Ma_Hang"] == ma_hang].iloc[0]
         is_safe = float(row["So_Luong_Ton"]) > float(dm_info["Nguong_An_Toan"])
         delta_color = "normal" if is_safe else "inverse"
         delta_text = f"Ngưỡng: {format_qty(dm_info['Nguong_An_Toan'])} m3"
 
+        # --- [SỬA ĐỂ FIX BUG] Gọi hàm get_sarima_forecast trực tiếp thay vì hàm cũ ---
+        try:
+            fc = analytics.get_sarima_forecast(ma_hang, steps=1)
+            predicted_demand = f"{fc[0]:.1f}" if fc else "Không đủ data"
+        except Exception:
+            predicted_demand = "Lỗi tính toán"
+        # --------------------------------------------------------------------------
+
         with cols[i]:
             st.metric(
-                ITEM_LABELS.get(row["Ma_Hang"], row["Ma_Hang"]),
+                ITEM_LABELS.get(ma_hang, ma_hang),
                 f"{format_qty(row['So_Luong_Ton'])} m3",
                 delta_text,
                 delta_color=delta_color,
             )
+            
+            st.info(f"🔮 Dự báo xuất tháng tới (SARIMA): **{predicted_demand} m3**")
+            
             est_value = float(row["So_Luong_Ton"]) * float(dm_info["Don_Gia"])
             st.caption(f"Giá trị tồn ước tính: {est_value:,.0f} đ")
 
-    replenishment_snapshot = build_replenishment_table(df_stock, df_dm, df_history, lookback_days=30)
+    replenishment_snapshot = build_replenishment_table(df_stock, df_dm, df_history_all, lookback_days=30)
     high_risk = replenishment_snapshot[
         replenishment_snapshot["Trạng thái"].isin(["Rủi ro cao", "Cần lên đơn"])
     ]
@@ -331,12 +359,12 @@ with col_dash:
             "📈 Trung tâm nhập hàng",
             "🧮 Kiểm kê & Điều chỉnh",
             "🧑‍🤝‍🧑 Đối tác & Cảnh báo",
-            "🗃️ Dữ liệu tổng thể",
+            f"🗃️ Dữ liệu năm {selected_year}",
         ]
     )
 
     with tabs[0]:
-        draw_stock_chart(df_history, "Xuat", ["#E63946", "#F4A261"])
+        draw_stock_chart(df_history_filtered, "Xuat", ["#E63946", "#F4A261"]) 
 
         with st.form("f_xuat", clear_on_submit=True):
             st.markdown("**📝 Tạo giao dịch Xuất mới**")
@@ -359,7 +387,7 @@ with col_dash:
                     st.error(str(exc))
 
     with tabs[1]:
-        draw_stock_chart(df_history, "Nhap", ["#2A9D8F", "#457B9D"])
+        draw_stock_chart(df_history_filtered, "Nhap", ["#2A9D8F", "#457B9D"]) 
 
         with st.form("f_nhap", clear_on_submit=True):
             st.markdown("**📝 Tạo giao dịch Nhập mới**")
@@ -384,7 +412,7 @@ with col_dash:
     with tabs[2]:
         st.subheader("📈 Trung tâm nhập hàng")
         lookback_days = st.slider("Khoảng dữ liệu để tính nhu cầu xuất trung bình", 14, 90, 30, 1)
-        repl = build_replenishment_table(df_stock, df_dm, df_history, lookback_days=lookback_days)
+        repl = build_replenishment_table(df_stock, df_dm, df_history_all, lookback_days=lookback_days)
         st.dataframe(repl, width="stretch", hide_index=True)
 
         chart_data = repl[["Mặt hàng", "Đề xuất nhập (m3)"]].copy()
@@ -449,7 +477,7 @@ with col_dash:
 
         with c1:
             st.markdown("**Top khách hàng / công trình**")
-            customer_summary = build_partner_summary(df_history, "Xuat")
+            customer_summary = build_partner_summary(df_history_all, "Xuat")
             st.dataframe(customer_summary, width="stretch", hide_index=True)
 
             if not customer_summary.empty:
@@ -459,7 +487,7 @@ with col_dash:
 
         with c2:
             st.markdown("**Top nhà cung cấp**")
-            supplier_summary = build_partner_summary(df_history, "Nhap")
+            supplier_summary = build_partner_summary(df_history_all, "Nhap")
             st.dataframe(supplier_summary, width="stretch", hide_index=True)
 
             if not supplier_summary.empty:
@@ -468,7 +496,7 @@ with col_dash:
                 st.plotly_chart(fig, width="stretch")
 
         st.markdown("**Cảnh báo tăng nhịp xuất bất thường**")
-        anomalies = detect_outbound_anomalies(df_history)
+        anomalies = detect_outbound_anomalies(df_history_all)
 
         if anomalies.empty:
             st.success("7 ngày gần nhất chưa thấy mặt hàng nào tăng nhịp xuất bất thường so với nền 30 ngày trước đó.")
@@ -477,24 +505,27 @@ with col_dash:
             st.dataframe(anomalies, width="stretch", hide_index=True)
 
     with tabs[5]:
-        st.subheader("🗃️ Dữ liệu tổng thể")
-        df_show = df_history_all.copy()
+        st.subheader(f"🗃️ Dữ liệu tổng thể năm {selected_year}")
+        df_show = df_history_filtered.copy()
         if not df_show.empty:
             df_show["Ngay_Giao_Dich"] = df_show["Ngay_Giao_Dich"].dt.strftime("%d/%m/%Y %H:%M")
             df_show["So_Luong"] = df_show["So_Luong"].map(lambda x: f"{float(x):,.1f}")
-        st.dataframe(df_show, width="stretch", hide_index=True)
+        st.dataframe(df_show.drop(columns=['Year'], errors='ignore'), width="stretch", hide_index=True)
 
-        csv_data = df_history_all.to_csv(index=False).encode("utf-8-sig")
+        csv_data = df_history_filtered.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
-            "Tải CSV toàn bộ lịch sử giao dịch",
+            f"Tải CSV lịch sử giao dịch năm {selected_year}",
             data=csv_data,
-            file_name="lich_su_giao_dich_cat_day_du.csv",
+            file_name=f"lich_su_giao_dich_cat_{selected_year}.csv",
             mime="text/csv",
-            disabled=df_history_all.empty,
+            disabled=df_history_filtered.empty,
         )
 
 with col_chat:
     st.subheader("🤖 AI Copilot")
+    
+    forecast_steps = st.slider("Số tháng AI cần nhìn xa:", 1, 6, 3)
+    st.caption(f"AI sẽ tham chiếu mô hình SARIMA để dự báo {forecast_steps} tháng tới.")
 
     if "messages" not in st.session_state:
         st.session_state.messages = [
@@ -525,7 +556,7 @@ with col_chat:
             st.chat_message("user").write(prompt)
             with st.spinner("Đang phân tích dữ liệu kho..."):
                 try:
-                    response = ai_agent.get_copilot_response(prompt, df_stock, df_dm, df_history)
+                    response = ai_agent.get_copilot_response(prompt, df_stock, df_dm, df_history_all, forecast_months=forecast_steps)
                 except Exception as exc:
                     response = f"Lỗi khi gọi AI: {exc}"
 
